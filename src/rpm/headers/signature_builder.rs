@@ -4,6 +4,8 @@ use super::*;
 
 use super::IndexEntry;
 use crate::constants::*;
+#[cfg(feature = "signature-pgp")]
+use crate::signature::pgp::Verifier;
 use std::default::Default;
 
 /// A marker trait for builder stages
@@ -16,14 +18,9 @@ pub struct Empty;
 /// Implies that headers and content are complete.
 pub struct WithDigest;
 
-/// Builder already has a hash and is ready for completion.
-pub struct WithSignature;
-
 impl ConstructionStage for Empty {}
 
 impl ConstructionStage for WithDigest {}
-
-impl ConstructionStage for WithSignature {}
 
 /// base signature header builder
 ///
@@ -33,6 +30,7 @@ where
     T: ConstructionStage,
 {
     entries: Vec<IndexEntry<IndexSignatureTag>>,
+    signatures: Vec<String>,
     phantom: std::marker::PhantomData<T>,
 }
 
@@ -40,6 +38,7 @@ impl SignatureHeaderBuilder<Empty> {
     pub fn new() -> Self {
         Self {
             entries: Vec::with_capacity(10),
+            signatures: Vec::new(),
             phantom: Default::default(),
         }
     }
@@ -56,11 +55,23 @@ where
     T: ConstructionStage,
 {
     /// Construct the complete signature header.
-    pub fn build(self) -> Header<IndexSignatureTag> {
-        Header::<IndexSignatureTag>::from_entries(
+    pub fn build(self) -> Result<Header<IndexSignatureTag>, crate::Error> {
+        use pgp::{base64_decoder::Base64Decoder, base64_reader::Base64Reader};
+        use std::io::Read;
+
+        for signature in self.signatures {
+            let mut decoded_sig = Vec::new();
+            let mut decoder = Base64Decoder::new(Base64Reader::new(signature.as_bytes()));
+            decoder.read_to_end(&mut decoded_sig)?;
+            Verifier::parse_signature(&decoded_sig)?;
+        }
+
+        let header = Header::<IndexSignatureTag>::from_entries(
             self.entries,
             IndexSignatureTag::HEADER_SIGNATURES,
-        )
+        );
+
+        Ok(header)
     }
 }
 
@@ -75,59 +86,56 @@ impl SignatureHeaderBuilder<Empty> {
         ));
         SignatureHeaderBuilder::<WithDigest> {
             entries: self.entries,
+            signatures: Vec::new(),
             phantom: Default::default(),
         }
     }
 }
 
 impl SignatureHeaderBuilder<WithDigest> {
+    pub fn add_openpgp_signature(mut self, signature: String) -> Self {
+        self.signatures.push(signature);
+        self
+    }
+
     /// add a signature over the header
     pub fn add_rsa_signature(
         mut self,
         sig_header_only: &[u8],
-    ) -> SignatureHeaderBuilder<WithSignature> {
+    ) -> Self {
         let offset = 0i32; // filled externally later on
         self.entries.push(IndexEntry::new(
             IndexSignatureTag::RPMSIGTAG_RSA,
             offset,
             IndexData::Bin(sig_header_only.to_vec()),
         ));
-        SignatureHeaderBuilder::<WithSignature> {
-            entries: self.entries,
-            phantom: Default::default(),
-        }
+        self
     }
 
     pub fn add_eddsa_signature(
         mut self,
         sig_header_only: &[u8],
-    ) -> SignatureHeaderBuilder<WithSignature> {
+    ) -> SignatureHeaderBuilder<WithDigest> {
         let offset = 0i32; // filled externally later on
         self.entries.push(IndexEntry::new(
             IndexSignatureTag::RPMSIGTAG_DSA,
             offset,
             IndexData::Bin(sig_header_only.to_vec()),
         ));
-        SignatureHeaderBuilder::<WithSignature> {
-            entries: self.entries,
-            phantom: Default::default(),
-        }
+        self
     }
 
     pub fn add_ecdsa_signature(
         mut self,
         sig_header_only: &[u8],
-    ) -> SignatureHeaderBuilder<WithSignature> {
+    ) -> SignatureHeaderBuilder<WithDigest> {
         let offset = 0i32; // filled externally later on
         self.entries.push(IndexEntry::new(
             IndexSignatureTag::RPMSIGTAG_DSA,
             offset,
             IndexData::Bin(sig_header_only.to_vec()),
         ));
-        SignatureHeaderBuilder::<WithSignature> {
-            entries: self.entries,
-            phantom: Default::default(),
-        }
+        self
     }
 }
 
@@ -143,7 +151,8 @@ mod test {
         let header = builder
             .add_digest(digest_header_sha256.as_str())
             .add_rsa_signature(&sig_header_only[..])
-            .build();
+            .build()
+            .unwrap();
 
         assert!(
             header
@@ -166,7 +175,8 @@ mod test {
         let header = builder
             .add_digest(digest_header_sha256.as_str())
             .add_eddsa_signature(&sig_header_only[..])
-            .build();
+            .build()
+            .unwrap();
 
         assert!(
             header
@@ -184,7 +194,7 @@ mod test {
     fn signature_builder_digest_only() {
         let builder = SignatureHeaderBuilder::<Empty>::new();
         let digest_header_sha256: String = hex::encode([0u8; 64]);
-        let header = builder.add_digest(digest_header_sha256.as_str()).build();
+        let header = builder.add_digest(digest_header_sha256.as_str()).build().unwrap();
 
         assert!(
             header
@@ -226,7 +236,8 @@ mod test {
         let built = Header::<IndexSignatureTag>::builder()
             .add_digest(digest_header_sha256)
             .add_rsa_signature(sig_header_only)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(built, truth);
     }

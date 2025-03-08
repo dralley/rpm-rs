@@ -598,7 +598,7 @@ impl PackageBuilder {
 
             Header::<IndexSignatureTag>::builder()
                 .add_digest(header_digest_sha256.as_str())
-                .build()
+                .build()?
         };
 
         let metadata = PackageMetadata {
