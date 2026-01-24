@@ -391,35 +391,6 @@ pub enum IndexTag {
 #[allow(non_camel_case_types)]
 pub enum IndexSignatureTag {
     HEADER_SIGNATURES = HEADER_SIGNATURES,
-    /// This tag specifies the combined size of the Header and Payload sections.
-    RPMSIGTAG_SIZE = HEADER_TAGBASE,
-
-    /// This tag specifies the uncompressed size of the Payload archive, including the cpio headers.
-    RPMSIGTAG_PAYLOADSIZE = HEADER_TAGBASE + 7,
-
-    /// The SHA1 checksum of the entire Header Section, including the Header Record, Index Records and
-    /// Header store, stored as a hex-encoded string.
-    RPMSIGTAG_SHA1 = 269,
-
-    /// This tag specifies the 128-bit MD5 checksum of the combined Header and Archive sections, stored as
-    /// a binary representation.
-    RPMSIGTAG_MD5 = 1004,
-
-    /// The tag contains the DSA signature of the Header section.
-    /// The data is formatted as a Version 3 Signature Packet as specified in RFC 2440: OpenPGP Message Format.
-    /// If this tag is present, then the SIGTAG_GPG tag shall also be present.
-    RPMSIGTAG_DSA = 267,
-
-    /// The tag contains the RSA signature of the Header section.
-    /// The data is formatted as a Version 3 Signature Packet as specified in RFC 2440: OpenPGP Message Format.
-    /// If this tag is present, then the SIGTAG_PGP shall also be present.
-    RPMSIGTAG_RSA = 268,
-
-    /// Size of combined header and payload if > 4GB.
-    RPMSIGTAG_LONGSIZE = 270,
-
-    /// This tag specifies the uncompressed size of the Payload archive, including the cpio headers, when >4gb.
-    RPMSIGTAG_LONGARCHIVESIZE = IndexTag::RPMTAG_LONGARCHIVESIZE as u32,
 
     /// The tag contains the file signature of a file.
     /// The data is formatted as a hex-encoded string.
@@ -438,9 +409,38 @@ pub enum IndexSignatureTag {
     /// All OpenPGP signatures present in the header
     RPMSIGTAG_OPENPGP = IndexTag::RPMTAG_OPENPGP as u32,
 
+    /// The tag contains the DSA signature of the Header section.
+    /// The data is formatted as a Version 3 Signature Packet as specified in RFC 2440: OpenPGP Message Format.
+    /// If this tag is present, then the SIGTAG_GPG tag shall also be present.
+    RPMSIGTAG_DSA = 267,
+
+    /// The tag contains the RSA signature of the Header section.
+    /// The data is formatted as a Version 3 Signature Packet as specified in RFC 2440: OpenPGP Message Format.
+    /// If this tag is present, then the SIGTAG_PGP shall also be present.
+    RPMSIGTAG_RSA = 268,
+
+    /// The SHA1 checksum of the entire Header Section, including the Header Record, Index Records and
+    /// Header store, stored as a hex-encoded string.
+    RPMSIGTAG_SHA1 = 269,
+
     /// This tag contains the SHA3-256 checksum of the entire Header Section, including the Header Record,
     /// Index Records and Header store, stored as a hex-encoded string.
     RPMSIGTAG_SHA3_256 = IndexTag::RPMTAG_SHA3_256_HEADER as u32,
+
+    /// This tag contains the SHA256 checksum of the entire Header Section, including the Header Record,
+    /// Index Records and Header store, stored as a hex-encoded string.
+    RPMSIGTAG_SHA256 = IndexTag::RPMTAG_SHA256HEADER as u32,
+
+    /// A silly tag for a date.
+    RPMTAG_INSTALLTIME = IndexTag::RPMTAG_INSTALLTIME as u32,
+
+    //////////////////////////////////////////
+    /* Various legacy tags - all deprecated */
+    //////////////////////////////////////////
+
+    /// This tag specifies the 128-bit MD5 checksum of the combined Header and Archive sections, stored as
+    /// a binary representation.
+    RPMSIGTAG_MD5 = 1004,
 
     /// This tag specifies the RSA signature of the combined Header and Payload sections.
     /// The data is formatted as a Version 3 Signature Packet as specified in RFC 2440: OpenPGP Message Format.
@@ -450,12 +450,17 @@ pub enum IndexSignatureTag {
     /// The data is formatted as a Version 3 Signature Packet as specified in RFC 2440: OpenPGP Message Format.
     RPMSIGTAG_GPG = 1005,
 
-    /// This tag contains the SHA256 checksum of the entire Header Section, including the Header Record,
-    /// Index Records and Header store, stored as a hex-encoded string.
-    RPMSIGTAG_SHA256 = IndexTag::RPMTAG_SHA256HEADER as u32,
+    /// This tag specifies the combined size of the Header and Payload sections.
+    RPMSIGTAG_SIZE = HEADER_TAGBASE,
 
-    /// A silly tag for a date.
-    RPMTAG_INSTALLTIME = IndexTag::RPMTAG_INSTALLTIME as u32,
+    /// This tag specifies the uncompressed size of the Payload archive, including the cpio headers.
+    RPMSIGTAG_PAYLOADSIZE = HEADER_TAGBASE + 7,
+
+    /// Size of combined header and payload if > 4GB.
+    RPMSIGTAG_LONGSIZE = 270,
+
+    /// This tag specifies the uncompressed size of the Payload archive, including the cpio headers, when >4gb.
+    RPMSIGTAG_LONGARCHIVESIZE = IndexTag::RPMTAG_LONGARCHIVESIZE as u32,
 }
 
 /// Header tag.
