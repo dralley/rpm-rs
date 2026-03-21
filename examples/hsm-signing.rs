@@ -1,8 +1,15 @@
 use clap::Parser;
-use pgp::types::{KeyVersion, Timestamp};
-use rpm::Package;
+use pgp::{
+    adapter::RsaSigner,
+    packet::PacketTrait,
+    types::{KeyDetails, KeyVersion, Password, SigningKey, Timestamp},
+};
+use rpm::{
+    Error, Package,
+    signature::{Signing, pgp::Signer},
+};
 use rsa::{RsaPrivateKey, pkcs1v15};
-use std::path::PathBuf;
+use std::{fmt, io, path::PathBuf};
 
 /// Sign an RPM with a random RPM key
 #[derive(Parser, Debug)]
@@ -26,13 +33,48 @@ fn main() {
 
     // pgp::adapter::RsaSigner accept any key that implements [`signature::Keypair`] and
     // [`signature::PrehashSigner`].
-    let rsa_signer = pgp::adapter::RsaSigner::new(rsa_key, KeyVersion::V4, Timestamp::now())
-        .expect("create a PGP signer");
+    let rsa_signer =
+        RsaSigner::new(rsa_key, KeyVersion::V4, Timestamp::now()).expect("create a PGP signer");
 
-    let pgp_signer = rpm::signature::pgp::Signer::new(rsa_signer).expect("Create an RPM signer");
+    let pgp_signer = HsmSigner {
+        secret_key: rsa_signer,
+    };
 
     let mut pkg = Package::open(args.input).expect("open source rpm");
     pkg.sign(pgp_signer)
         .expect("Sign the package with the private key");
     pkg.write_file(args.output).expect("write signed RPM");
+}
+
+pub struct HsmSigner<T> {
+    secret_key: T,
+}
+
+impl<T> fmt::Debug for HsmSigner<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HsmSigner").finish_non_exhaustive()
+    }
+}
+
+impl<T> Signing for HsmSigner<T>
+where
+    T: KeyDetails + SigningKey,
+{
+    type Signature = Vec<u8>;
+
+    fn sign(&self, data: impl io::Read, t: rpm::Timestamp) -> Result<Self::Signature, Error> {
+        let sig_cfg = Signer::prepare_signer_configuration(&self.secret_key, t)?;
+
+        let signature_packet = sig_cfg
+            .sign(&self.secret_key, &Password::empty(), data)
+            .map_err(Error::SignError)?;
+
+        let mut signature_bytes = Vec::with_capacity(1024);
+        let mut cursor = io::Cursor::new(&mut signature_bytes);
+        signature_packet
+            .to_writer_with_header(&mut cursor)
+            .map_err(Error::SignError)?;
+
+        Ok(signature_bytes)
+    }
 }
