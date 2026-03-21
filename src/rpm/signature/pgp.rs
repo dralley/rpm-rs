@@ -112,39 +112,7 @@ impl traits::Signing for Signer {
     type Signature = Vec<u8>;
 
     fn sign(&self, data: impl io::Read, t: crate::Timestamp) -> Result<Self::Signature, Error> {
-        let t = pgp::types::Timestamp::from_secs(t.0);
-
-        let hash_alg = HashAlgorithm::Sha256;
-        let pub_alg = self.signing_key.algorithm();
-        let mut sig_cfg = match self.signing_key.version() {
-            KeyVersion::V6 => {
-                let salt_len = hash_alg
-                    .salt_len()
-                    .expect("Sha256 always has a v6 salt length");
-                let mut salt = vec![0u8; salt_len];
-                getrandom::getrandom(&mut salt).expect("failed to generate random salt");
-                SignatureConfig::v6_with_salt(SignatureType::Binary, pub_alg, hash_alg, salt)
-            }
-            _ => SignatureConfig::v4(SignatureType::Binary, pub_alg, hash_alg),
-        };
-
-        sig_cfg
-            .hashed_subpackets
-            .push(Subpacket::regular(SubpacketData::SignatureCreationTime(t))?);
-        sig_cfg
-            .hashed_subpackets
-            .push(Subpacket::regular(SubpacketData::IssuerFingerprint(
-                self.signing_key.fingerprint(),
-            ))?);
-
-        // v4 signatures include the legacy key ID; v6 signatures do not
-        if self.signing_key.version() != KeyVersion::V6 {
-            sig_cfg
-                .hashed_subpackets
-                .push(Subpacket::regular(SubpacketData::IssuerKeyId(
-                    self.signing_key.legacy_key_id(),
-                ))?);
-        }
+        let mut sig_cfg = Self::prepare_signer_configuration(&self.signing_key, t)?;
 
         if let Some(ref uid) = self.user_id {
             sig_cfg
@@ -268,6 +236,51 @@ impl Signer {
             key_passphrase: Some(key_passphrase.into()),
             ..self
         }
+    }
+
+    /// Prepare the configuration to sign with a given signing key
+    ///
+    /// This will place the expected subpackets in the object about to be signed
+    /// with the underlying private key.
+    pub fn prepare_signer_configuration<T: KeyDetails>(
+        signing_key: &T,
+        t: crate::Timestamp,
+    ) -> Result<SignatureConfig, Error> {
+        let t = pgp::types::Timestamp::from_secs(t.0);
+
+        let hash_alg = HashAlgorithm::Sha256;
+        let pub_alg = signing_key.algorithm();
+        let mut sig_cfg = match signing_key.version() {
+            KeyVersion::V6 => {
+                let salt_len = hash_alg
+                    .salt_len()
+                    .expect("Sha256 always has a v6 salt length");
+                let mut salt = vec![0u8; salt_len];
+                getrandom::getrandom(&mut salt).expect("failed to generate random salt");
+                SignatureConfig::v6_with_salt(SignatureType::Binary, pub_alg, hash_alg, salt)
+            }
+            _ => SignatureConfig::v4(SignatureType::Binary, pub_alg, hash_alg),
+        };
+
+        sig_cfg
+            .hashed_subpackets
+            .push(Subpacket::regular(SubpacketData::SignatureCreationTime(t))?);
+        sig_cfg
+            .hashed_subpackets
+            .push(Subpacket::regular(SubpacketData::IssuerFingerprint(
+                signing_key.fingerprint(),
+            ))?);
+
+        // v4 signatures include the legacy key ID; v6 signatures do not
+        if signing_key.version() != KeyVersion::V6 {
+            sig_cfg
+                .hashed_subpackets
+                .push(Subpacket::regular(SubpacketData::IssuerKeyId(
+                    signing_key.legacy_key_id(),
+                ))?);
+        }
+
+        Ok(sig_cfg)
     }
 }
 
