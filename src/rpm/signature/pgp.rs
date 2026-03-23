@@ -1,7 +1,7 @@
 use super::traits;
 use crate::errors::Error;
 
-use std::io;
+use std::{fmt, io};
 use zeroize::Zeroizing;
 
 use pgp::{
@@ -242,7 +242,7 @@ impl Signer {
     ///
     /// This will place the expected subpackets in the object about to be signed
     /// with the underlying private key.
-    pub fn prepare_signer_configuration<T: KeyDetails>(
+    fn prepare_signer_configuration<T: KeyDetails>(
         signing_key: &T,
         t: crate::Timestamp,
     ) -> Result<SignatureConfig, Error> {
@@ -407,6 +407,47 @@ impl Verifier {
         validate_algorithm(public_key.algorithm())?;
 
         Ok(Self { public_key })
+    }
+}
+
+/// Signer for a key held on a secure processor (TPM, HSM, ...)
+pub struct HsmSigner<T> {
+    secret_key: T,
+}
+
+impl<T> HsmSigner<T> {
+    /// Create a new [`HsmSigner`] with the underlying `secret_key`
+    pub fn new(secret_key: T) -> Self {
+        Self { secret_key }
+    }
+}
+
+impl<T> fmt::Debug for HsmSigner<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HsmSigner").finish_non_exhaustive()
+    }
+}
+
+impl<T> traits::Signing for HsmSigner<T>
+where
+    T: KeyDetails + SigningKey,
+{
+    type Signature = Vec<u8>;
+
+    fn sign(&self, data: impl io::Read, t: crate::Timestamp) -> Result<Self::Signature, Error> {
+        let sig_cfg = Signer::prepare_signer_configuration(&self.secret_key, t)?;
+
+        let signature_packet = sig_cfg
+            .sign(&self.secret_key, &Password::empty(), data)
+            .map_err(Error::SignError)?;
+
+        let mut signature_bytes = Vec::with_capacity(1024);
+        let mut cursor = io::Cursor::new(&mut signature_bytes);
+        signature_packet
+            .to_writer_with_header(&mut cursor)
+            .map_err(Error::SignError)?;
+
+        Ok(signature_bytes)
     }
 }
 
