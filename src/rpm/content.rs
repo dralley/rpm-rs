@@ -1,6 +1,11 @@
 //! Access and extract RPM package payload contents (files, directories, symlinks).
 
-use std::{fs, io, io::Read, path::Path};
+use std::{
+    collections::HashMap,
+    fs, io,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -10,6 +15,44 @@ use crate::{constants::*, decompress_stream, errors::*};
 use super::headers::*;
 use super::package::{Package, PackageMetadata};
 use super::payload;
+
+/// Group regular file entries that share an RPM inode number.
+fn hardlink_groups(file_entries: &[FileEntry<'_>], inodes: &[u32]) -> HashMap<u32, Vec<usize>> {
+    let mut groups = HashMap::new();
+    for (index, entry) in file_entries.iter().enumerate() {
+        if entry.file_type() == FileType::Regular
+            && let Some(&inode) = inodes.get(index)
+        {
+            groups.entry(inode).or_insert_with(Vec::new).push(index);
+        }
+    }
+    groups.retain(|_, indexes| indexes.len() > 1);
+    groups
+}
+
+/// Return the number of payload bytes for each RPM file entry.
+///
+/// Stripped CPIO records for earlier members of a hardlink group contain no
+/// data; the final member carries the shared file contents.
+fn payload_sizes(metadata: &PackageMetadata, file_entries: &[FileEntry<'_>]) -> Vec<u64> {
+    let mut sizes = file_entries
+        .iter()
+        .map(|entry| entry.size() as u64)
+        .collect::<Vec<_>>();
+    let inodes = metadata
+        .header
+        .get_entry_data_as_u32_array(IndexTag::RPMTAG_FILEINODES)
+        .unwrap_or_default();
+    for indexes in hardlink_groups(file_entries, &inodes).values() {
+        let content_index = *indexes.last().expect("hardlink group is not empty");
+        for &index in indexes {
+            if index != content_index {
+                sizes[index] = 0;
+            }
+        }
+    }
+    sizes
+}
 
 #[cfg(unix)]
 fn symlink(original: impl AsRef<Path>, link: impl AsRef<Path>) -> Result<(), Error> {
@@ -70,6 +113,7 @@ impl Package {
             .filter_map(|(index, entry)| entry.flags.contains(FileFlags::GHOST).then_some(index))
             .collect();
         let file_count = file_entries.len();
+        let payload_sizes = payload_sizes(&self.metadata, &file_entries);
         let archive = decompress_stream(io::Cursor::new(&self.payload))?;
 
         Ok(FileIterator {
@@ -80,6 +124,7 @@ impl Package {
             ghosts,
             ghost_index: 0,
             seen: vec![false; file_count],
+            payload_sizes,
         })
     }
 
@@ -122,18 +167,38 @@ impl Package {
             fs::create_dir_all(&dir_path)?;
         }
 
-        let mut archive = decompress_stream(io::Cursor::new(&self.payload))?;
         let file_entries = self.metadata.get_file_entries()?;
+        let inodes = self
+            .metadata
+            .header
+            .get_entry_data_as_u32_array(IndexTag::RPMTAG_FILEINODES)
+            .unwrap_or_default();
+        let inode_by_path = file_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                inodes
+                    .get(index)
+                    .copied()
+                    .map(|inode| (entry.path(), inode))
+            })
+            .collect::<HashMap<_, _>>();
+        let hardlink_target_paths = hardlink_groups(&file_entries, &inodes)
+            .into_iter()
+            .filter_map(|(inode, indexes)| {
+                indexes
+                    .last()
+                    .map(|&index| (inode, file_entries[index].path()))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut deferred_hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-        for file_entry in file_entries.iter() {
-            // Ghost files are not present in the payload archive and should not be created
+        for file in self.files()? {
+            let file = file?;
+            let file_entry = &file.metadata;
+            // Ghost files are not present in the payload archive and should not be created.
             if file_entry.flags.contains(FileFlags::GHOST) {
                 continue;
-            }
-
-            let mut entry_reader = payload::Reader::new(&mut archive, &file_entries)?;
-            if entry_reader.is_trailer() {
-                return Ok(());
             }
             let entry_path = file_entry.path();
             let file_path = dest
@@ -149,12 +214,34 @@ impl Package {
                     }
                 }
                 FileType::Regular => {
-                    let mut f = fs::File::create(&file_path)?;
-                    io::copy(&mut entry_reader, &mut f)?;
-                    #[cfg(unix)]
-                    {
-                        let perms = fs::Permissions::from_mode(file_entry.permissions().into());
-                        f.set_permissions(perms)?;
+                    let inode = inode_by_path.get(&entry_path).copied();
+                    let hardlink_target = inode.and_then(|inode| {
+                        hardlink_target_paths.get(&inode).map(|target| {
+                            dest.as_ref()
+                                .join(target.strip_prefix("/").unwrap_or(dest.as_ref()))
+                        })
+                    });
+                    if let Some(target) = hardlink_target {
+                        if target == file_path {
+                            let mut f = fs::File::create(&file_path)?;
+                            io::copy(&mut file.content.as_slice(), &mut f)?;
+                            #[cfg(unix)]
+                            {
+                                let perms =
+                                    fs::Permissions::from_mode(file_entry.permissions().into());
+                                f.set_permissions(perms)?;
+                            }
+                        } else {
+                            deferred_hardlinks.push((target, file_path));
+                        }
+                    } else {
+                        let mut f = fs::File::create(&file_path)?;
+                        io::copy(&mut file.content.as_slice(), &mut f)?;
+                        #[cfg(unix)]
+                        {
+                            let perms = fs::Permissions::from_mode(file_entry.permissions().into());
+                            f.set_permissions(perms)?;
+                        }
                     }
                 }
                 FileType::SymbolicLink => {
@@ -167,7 +254,10 @@ impl Package {
                 // Skip file types we don't handle (e.g. device nodes, FIFOs, sockets)
                 _ => {}
             }
-            entry_reader.finish()?;
+        }
+
+        for (target, link) in deferred_hardlinks {
+            fs::hard_link(target, link)?;
         }
 
         Ok(())
@@ -177,6 +267,7 @@ impl Package {
 pub struct FileIterator<'a> {
     file_entries: Vec<FileEntry<'a>>,
     archive: Box<dyn io::Read + 'a>,
+    payload_sizes: Vec<u64>,
     /// Number of entries yielded, including ghosts emitted after the payload.
     count: usize,
     /// Set after the CPIO trailer has been consumed; subsequent entries are ghosts.
@@ -214,7 +305,11 @@ impl<'a> Iterator for FileIterator<'a> {
 
         loop {
             if !self.payload_done {
-                let reader = payload::Reader::new(&mut self.archive, &self.file_entries);
+                let reader = payload::Reader::new_with_payload_sizes(
+                    &mut self.archive,
+                    &self.file_entries,
+                    Some(&self.payload_sizes),
+                );
 
                 let mut entry_reader = match reader {
                     Ok(reader) => reader,
@@ -379,6 +474,7 @@ pub struct PackageReader {
     pub metadata: PackageMetadata,
     file_entries: Vec<FileEntry<'static>>,
     archive: Box<dyn Read>,
+    payload_sizes: Vec<u64>,
     /// Number of entries yielded, including ghosts emitted after the payload.
     count: usize,
     /// Set after the CPIO trailer has been consumed; subsequent entries are ghosts.
@@ -420,11 +516,13 @@ impl PackageReader {
             .filter_map(|(index, entry)| entry.flags.contains(FileFlags::GHOST).then_some(index))
             .collect();
         let file_count = file_entries.len();
+        let payload_sizes = payload_sizes(&metadata, &file_entries);
         let archive = decompress_stream(input)?;
         Ok(PackageReader {
             metadata,
             file_entries,
             archive,
+            payload_sizes,
             count: 0,
             payload_done: false,
             ghosts,
@@ -443,8 +541,12 @@ impl PackageReader {
     /// calling `next_file` again.
     pub fn next_file(&mut self) -> Result<Option<StreamingRpmFile<'_>>, Error> {
         if !self.payload_done {
-            let reader =
-                payload::Reader::new(&mut self.archive, &self.file_entries).map_err(Error::Io)?;
+            let reader = payload::Reader::new_with_payload_sizes(
+                &mut self.archive,
+                &self.file_entries,
+                Some(&self.payload_sizes),
+            )
+            .map_err(Error::Io)?;
             if !reader.is_trailer() {
                 let file_index = reader
                     .stripped_file_index()
@@ -555,6 +657,7 @@ mod test_payload_integration {
     use sha2::{Digest, Sha256};
     use std::borrow::Cow;
     use std::io::Read;
+    use std::path::Path;
 
     pub mod pkgs {
         pub mod v4 {
@@ -591,6 +694,10 @@ mod test_payload_integration {
             pub const RPM_FILE_TYPES: &str = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/assets/RPMS/v6/rpm-file-types-1.0-1.noarch.rpm"
+            );
+            pub const RPM_HARDLINKS: &str = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/assets/RPMS/v6/rpm-hardlinks-1.0-1.noarch.rpm"
             );
 
             pub mod compressed {
@@ -669,6 +776,62 @@ mod test_payload_integration {
     fn test_files_v4_uncompressed() -> Result<(), Box<dyn std::error::Error>> {
         let package = Package::open(pkgs::v4::RPM_BASIC)?;
         test_basic_package_files(&package)
+    }
+
+    /// Test extraction and payload iteration for RPM hardlink sets.
+    #[test]
+    fn test_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let package = Package::open(pkgs::v6::RPM_HARDLINKS)?;
+        let files: Vec<_> = package.files()?.collect::<Result<_, _>>()?;
+        let content = |path: &str| {
+            &files
+                .iter()
+                .find(|file| file.metadata.path() == Path::new(path))
+                .expect("file should be present")
+                .content
+        };
+
+        assert_eq!(content("/opt/rpm-hardlinks/alpha-1"), b"");
+        assert_eq!(content("/opt/rpm-hardlinks/alpha-2"), b"");
+        assert_eq!(
+            content("/opt/rpm-hardlinks/alpha-3"),
+            b"shared-content-alpha\n"
+        );
+        assert_eq!(content("/opt/rpm-hardlinks/beta-1"), b"");
+        assert_eq!(
+            content("/opt/rpm-hardlinks/beta-2"),
+            b"shared-content-beta\n"
+        );
+
+        let temp_dir = tempfile::tempdir()?;
+        let extract_path = temp_dir.path().join("rpm-hardlinks");
+        package.extract(&extract_path)?;
+        assert_eq!(
+            std::fs::read(extract_path.join("opt/rpm-hardlinks/alpha-1"))?,
+            b"shared-content-alpha\n"
+        );
+        assert_eq!(
+            std::fs::read(extract_path.join("opt/rpm-hardlinks/beta-1"))?,
+            b"shared-content-beta\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let inode = |path: &str| -> Result<u64, Box<dyn std::error::Error>> {
+                Ok(std::fs::metadata(extract_path.join(path))?.ino())
+            };
+            let alpha = inode("opt/rpm-hardlinks/alpha-1")?;
+            assert_eq!(alpha, inode("opt/rpm-hardlinks/alpha-2")?);
+            assert_eq!(alpha, inode("opt/rpm-hardlinks/alpha-3")?);
+
+            let beta = inode("opt/rpm-hardlinks/beta-1")?;
+            assert_eq!(beta, inode("opt/rpm-hardlinks/beta-2")?);
+            assert_ne!(alpha, beta);
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1863,7 +2026,13 @@ mod test_payload_integration {
     /// Package::files(), without loading the payload into memory upfront.
     #[test]
     fn test_package_reader_matches_files_api() -> Result<(), Box<dyn std::error::Error>> {
-        for path in [pkgs::v4::RPM_BASIC, pkgs::v6::RPM_BASIC] {
+        for path in [
+            pkgs::v4::RPM_BASIC,
+            pkgs::v6::RPM_BASIC,
+            pkgs::v6::RPM_FILE_ATTRS,
+            pkgs::v6::RPM_FILE_TYPES,
+            pkgs::v6::RPM_HARDLINKS,
+        ] {
             let package = Package::open(path)?;
             let expected: Vec<RpmFile> = package.files()?.collect::<Result<_, _>>()?;
 

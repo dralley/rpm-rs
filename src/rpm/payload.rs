@@ -314,7 +314,16 @@ impl<R: Read> Reader<R> {
 
     /// Parses metadata for the next entry in an archive, and returns a reader
     /// that will yield the entry data.
-    pub fn new(mut inner: R, file_entries: &[FileEntry<'_>]) -> io::Result<Reader<R>> {
+    pub fn new(inner: R, file_entries: &[FileEntry<'_>]) -> io::Result<Reader<R>> {
+        Self::new_with_payload_sizes(inner, file_entries, None)
+    }
+
+    /// Parse the next entry, using explicit payload sizes for stripped records.
+    pub(crate) fn new_with_payload_sizes(
+        mut inner: R,
+        file_entries: &[FileEntry<'_>],
+        payload_sizes: Option<&[u64]>,
+    ) -> io::Result<Reader<R>> {
         // char    c_magic[6];
         let mut magic = [0u8; 6];
         inner.read_exact(&mut magic)?;
@@ -423,9 +432,9 @@ impl<R: Read> Reader<R> {
             RpmPayloadEntry::Cpio(ref c) => c.file_size as u64,
             RpmPayloadEntry::Stripped(idx) => {
                 let idx = idx as usize;
-                file_entries
-                    .get(idx)
-                    .map(|e| e.size as u64)
+                payload_sizes
+                    .and_then(|sizes| sizes.get(idx).copied())
+                    .or_else(|| file_entries.get(idx).map(|e| e.size as u64))
                     .ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
