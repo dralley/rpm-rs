@@ -203,7 +203,16 @@ fn extraction_relative_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(sanitized)
 }
 
-/// Create a directory below `root` without traversing symbolic links.
+/// Ensure `relative` exists below `root` as real directories without following symbolic links.
+///
+/// `relative` must contain only normal path components, as produced by
+/// [`extraction_relative_path`]. Existing components are inspected with
+/// [`fs::symlink_metadata`] so symbolic links are rejected instead of traversed.
+/// Missing components are created one at a time.
+///
+/// This protects extraction from package-controlled traversal and pre-existing destination
+/// symlinks. It does not prevent a concurrent process from replacing a checked component; use a
+/// newly created extraction directory that untrusted processes cannot modify.
 fn ensure_safe_directory(root: &Path, relative: &Path) -> Result<PathBuf, Error> {
     let mut directory = root.to_path_buf();
 
@@ -213,6 +222,7 @@ fn ensure_safe_directory(root: &Path, relative: &Path) -> Result<PathBuf, Error>
         };
         directory.push(component);
 
+        // `metadata` follows links, but containment requires inspecting the component itself.
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(Error::InvalidDestinationPath {
@@ -231,6 +241,8 @@ fn ensure_safe_directory(root: &Path, relative: &Path) -> Result<PathBuf, Error>
                 match fs::create_dir(&directory) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        // Another process created the component after our lookup; verify it
+                        // satisfies the same invariant before continuing.
                         let metadata = fs::symlink_metadata(&directory)?;
                         if metadata.file_type().is_symlink() {
                             return Err(Error::InvalidDestinationPath {
@@ -381,9 +393,20 @@ impl Package {
     ///
     /// # Implementation
     ///
-    /// The if the directory is nested, its parent directories must already exist. If the
-    /// directory itself already exists, the operation will fail. All extracted files will be
-    /// dropped relative to the provided directory (it will not install any files).
+    /// If the destination is nested, its parent directories must already exist. If the destination
+    /// itself already exists, the operation will fail. All extracted files are written relative
+    /// to it; extraction does not install files into their RPM paths.
+    ///
+    /// # Extraction safety
+    ///
+    /// Package paths containing parent-directory components are rejected. Extraction also refuses
+    /// existing symbolic links and non-directory components below the destination, rather than
+    /// following them. This protects against package-controlled path traversal and pre-existing
+    /// links in the destination tree.
+    ///
+    /// Path-based filesystem operations cannot prevent a concurrent process from replacing a
+    /// checked component. Extract into a newly created directory that untrusted processes cannot
+    /// modify.
     ///
     /// ## Platform-specific behavior
     ///
